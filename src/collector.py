@@ -2,22 +2,18 @@
 # src/collector.py
 # -*- coding: utf-8 -*-
 """
-Coleta o 'Last login' dos jogadores a partir dos links de perfil encontrados
-na página da guild RubinOT informada pelo usuário.
+Coletor de 'Last login' para membros da guild True Knife no RubinOT.
 
 Fluxo:
-1) Lê data/players.json.
-2) Entra na página da guild (GUILD_URL).
-3) Mapeia nome -> URL do perfil.
-4) Para cada jogador da lista, acessa o perfil e pega 'Last login'.
-5) Salva snapshot (JSON) e histórico (CSV).
+1) Lê data/players.json (lista nominal enviada por você).
+2) Abre a página da guild True Knife e extrai os links dos perfis dos membros.
+3) Filtra para a INTERSEÇÃO: somente jogadores que estão na sua lista E na guild.
+4) Para cada jogador focado, acessa o perfil e extrai 'Last login'.
+5) Persiste snapshot (JSON) e histórico (CSV).
 
-Observações:
-- A página de personagem do RubinOT exibe 'Last login:' e segue o padrão
-  '?subtopic=characters&name=<nome>' (base + query). (Vide exemplo público.)
-- A página de guild segue '?subtopic=guilds&page=view&GuildName=<nome>' e contém
-  hyperlinks para os perfis dos membros.
-
+Referências públicas:
+- Página de personagem exibe 'Last login:' e segue '?subtopic=characters&name=<nome>'.
+- Página de guild segue '?subtopic=guilds&page=view&GuildName=<nome>' e lista membros com links.
 """
 
 import os
@@ -29,33 +25,39 @@ from urllib.parse import urlparse, urljoin, quote_plus
 
 import requests
 from bs4 import BeautifulSoup
-from dateutil import parser as dtparser
+from dateutil import parser as dtparser  # python-dateutil
 
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # raiz do projeto
+# Diretórios
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))   # raiz do projeto
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SNAP_DIR = os.path.join(DATA_DIR, "snapshots")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.csv")
 PLAYERS_FILE = os.path.join(DATA_DIR, "players.json")
 
-# 👉 Cole aqui a URL da guild que você me passou
+# URL fixa da guild True Knife (pode ser sobrescrita por variável de ambiente GUILD_URL, se quiser)
 GUILD_URL = os.environ.get(
     "GUILD_URL",
     "https://rubinot.com.br/?subtopic=guilds&page=view&GuildName=True+Knife"
 ).strip()
 
-# User-Agent simples para evitar bloqueios por default UA
+# Cabeçalhos para evitar bloqueios por user-agent padrão
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; RubinotGuildMonitor/1.0; +https://github.com/)",
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml"
 }
 
+# -------- utilidades --------
+
 def ensure_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(SNAP_DIR, exist_ok=True)
 
 def load_target_players():
-    """Lê 'data/players.json' (lista de jogadores) e retorna como set normalizado."""
+    """
+    Lê 'data/players.json' e retorna set de nomes (normalizados com strip).
+    Levanta erro se o arquivo não existir.
+    """
     path = PLAYERS_FILE
     if not os.path.isfile(path):
         raise FileNotFoundError(
@@ -63,14 +65,16 @@ def load_target_players():
         )
     with open(path, "r", encoding="utf-8") as f:
         players = json.load(f)
-    # Normaliza espaços e mantém o caso original (os nomes precisam bater com o site)
+
     players = [p.strip() for p in players if isinstance(p, str) and p.strip()]
     return set(players)
 
-def get_guild_member_links(guild_url):
+def get_guild_member_links(guild_url: str):
     """
-    Acessa a página da guild e extrai um dict: nome -> URL absoluta do perfil.
-    Procura por <a> cujo href contenha 'subtopic=characters' e usa o texto do link como nome.
+    Acessa a página da guild e retorna:
+      - member_links: dict {nome -> URL absoluta do perfil}
+      - profile_base: base para montar perfil quando não houver link (fallback)
+    Critério: anchors <a> cujo href contenha 'subtopic=characters'.
     """
     resp = requests.get(guild_url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
@@ -78,82 +82,74 @@ def get_guild_member_links(guild_url):
 
     member_links = {}
 
-    # Procura anchors que levem ao perfil do personagem
+    # Anchors que levam ao perfil do personagem
     for a in soup.select("a[href*='subtopic=characters']"):
         name = a.get_text(strip=True)
         href = a.get("href", "")
         if not name or not href:
             continue
-        # Torna a URL absoluta com base na URL da guild
         abs_url = urljoin(guild_url, href)
         member_links[name] = abs_url
 
-    # Se por algum motivo não achar links, ainda dá para montar a URL do perfil:
-    # base = scheme://netloc/?subtopic=characters&name=<NOME>
+    # Se não achou links, retorna uma base para tentar montar URL de perfil
     if not member_links:
         parsed = urlparse(guild_url)
-        base = f"{parsed.scheme}://{parsed.netloc}/?subtopic=characters&name="
-        # Vamos retornar só a base; o consumidor montará com quote_plus(nome)
-        return {}, base
+        profile_base = f"{parsed.scheme}://{parsed.netloc}/?subtopic=characters&name="
+        return {}, profile_base
 
-    return member_links, None  # quando há links, não precisa de base
+    return member_links, None
 
-def fetch_last_login(profile_url):
+def fetch_last_login(profile_url: str):
     """
-    Acessa a página de perfil do personagem e retorna (last_login_str, last_login_iso_opcional).
-    Busca por texto 'Last login' de forma case-insensitive e extrai após ':'.
+    Acessa a página de perfil do personagem e retorna:
+      - last_login_raw: string exatamente como aparece na página
+      - last_login_iso: ISO 8601, se conseguir parsear
+    Busca por 'Last login' (case-insensitive) no HTML.
     """
     resp = requests.get(profile_url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Procura qualquer nó de texto contendo 'Last login'
+    # 1) Procura nó de texto com 'Last login'
     candidate = soup.find(string=re.compile(r"last\\s*login", re.IGNORECASE))
     last_str = None
     if candidate:
-        # Tenta extrair o valor após ':'
         text = candidate.strip()
-        # Em muitos casos está no formato "Last login: 24/04/2024, 15:28:07"
+        # Ex.: "Last login: 24/04/2024, 15:28:07"
         parts = re.split(r":\\s*", text, maxsplit=1)
-        if len(parts) == 2:
+        if len(parts) == 2 and parts[1].strip():
             last_str = parts[1].strip()
 
-    # Caso a linha esteja em outro elemento, tenta percorrer irmãos/pai
+    # 2) Se não achou diretamente, tenta vizinhança/irmãos próximos
     if not last_str:
-        # Procura por elementos em que a label esteja e o valor em um <td>/span ao lado
         for el in soup.find_all(text=re.compile(r"last\\s*login", re.IGNORECASE)):
             parent = el.parent
-            # tenta próximos irmãos
             if parent:
-                sib_texts = []
-                for sib in parent.find_all_next(string=True, limit=3):
-                    t = sib.strip()
-                    if t and t != el.strip():
-                        sib_texts.append(t)
-                if sib_texts:
-                    # pega o primeiro que pareça uma data
-                    for t in sib_texts:
-                        if re.search(r"\\d{1,2}/\\d{1,2}/\\d{2,4}", t) or re.search(r"\\d{4}-\\d{2}-\\d{2}", t):
-                            last_str = t.strip()
-                            break
+                # procura textos próximos que pareçam data
+                for sib in parent.find_all_next(string=True, limit=4):
+                    t = (sib or "").strip()
+                    if not t or t == el.strip():
+                        continue
+                    if re.search(r"\\d{1,2}/\\d{1,2}/\\d{2,4}", t) or re.search(r"\\d{4}-\\d{2}-\\d{2}", t):
+                        last_str = t
+                        break
             if last_str:
                 break
 
-    # Tenta converter para ISO (se possível). RubinOT costuma usar dd/mm/yyyy HH:MM:SS.
+    # 3) Tenta converter para ISO (RubinOT costuma usar dd/mm/yyyy HH:MM:SS)
     last_iso = None
     if last_str:
         try:
             dt = dtparser.parse(last_str, dayfirst=True)
             last_iso = dt.isoformat()
         except Exception:
-            # mantém só o raw
             pass
 
     return last_str, last_iso
 
-def append_history(collection_ts_iso, rows):
+def append_history(collection_ts_iso: str, rows):
     """
-    rows: lista de dicts com {'player', 'profile_url', 'last_login_raw', 'last_login_iso'}
+    rows: lista de dicts com {'player','profile_url','last_login_raw','last_login_iso'}
     """
     file_exists = os.path.isfile(HISTORY_FILE)
     with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
@@ -166,11 +162,11 @@ def append_history(collection_ts_iso, rows):
                 r.get("player"),
                 r.get("profile_url"),
                 r.get("last_login_raw"),
-                r.get("last_login_iso")
+                r.get("last_login_iso"),
             ])
 
-def save_snapshot(collection_ts_iso, rows):
-    """Salva um snapshot JSON com os dados coletados na execução."""
+def save_snapshot(collection_ts_iso: str, rows):
+    """Salva snapshot JSON com os dados coletados."""
     fname = os.path.join(SNAP_DIR, f"snapshot_{collection_ts_iso.replace(':','-')}.json")
     with open(fname, "w", encoding="utf-8") as f:
         json.dump({
@@ -179,27 +175,48 @@ def save_snapshot(collection_ts_iso, rows):
             "players": rows
         }, f, ensure_ascii=False, indent=2)
 
+# -------- execução --------
+
 def main():
     ensure_dirs()
+
+    # 1) Carrega sua lista nominal
     target = load_target_players()
     if not target:
         print("[ERRO] Lista de jogadores vazia em data/players.json.")
         return
 
+    # 2) Lê membros da guild True Knife pela página
     member_links, profile_base = get_guild_member_links(GUILD_URL)
 
+    # Segurança: se não conseguimos obter NENHUMA forma de confirmar membros, aborta
+    if not member_links and not profile_base:
+        print("[ERRO] Não foi possível obter membros na página da guild. Verifique GUILD_URL.")
+        return
+
+    guild_members = set(member_links.keys()) if member_links else set()
+
+    # 3) Foco EXCLUSIVO: interseção entre sua lista e os membros da guild
+    if guild_members:
+        focus = sorted(target & guild_members)
+    else:
+        # Se não conseguimos listar membros (apenas uma base para construir URL),
+        # não temos como garantir que um nome é da guild -> aborta para manter exclusividade.
+        print("[ERRO] Não consegui confirmar a lista de membros da guild. Abortando para manter foco exclusivo.")
+        return
+
+    if not focus:
+        print("[INFO] Nenhum dos jogadores em data/players.json está atualmente listado como membro da guild True Knife.")
+        return
+
+    # 4) Para cada jogador focado, acessar o perfil via link da própria página da guild
     rows = []
-    for player in sorted(target):
-        # Descobre a URL do perfil
-        if player in member_links:
-            profile_url = member_links[player]
-        else:
-            # monta pela base (se disponível) ou pelo domínio da guild
-            if profile_base:
-                profile_url = profile_base + quote_plus(player)
-            else:
-                parsed = urlparse(GUILD_URL)
-                profile_url = f"{parsed.scheme}://{parsed.netloc}/?subtopic=characters&name={quote_plus(player)}"
+    for player in focus:
+        profile_url = member_links.get(player)
+        if not profile_url:
+            # Em teoria não deve acontecer se member_links veio; se acontecer, pula.
+            print(f"[WARN] Perfil não encontrado via link para '{player}'. Pulando.")
+            continue
 
         last_raw, last_iso = None, None
         try:
@@ -214,12 +231,14 @@ def main():
             "last_login_iso": last_iso,
         })
 
+    # 5) Persistência
     ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     save_snapshot(ts, rows)
     append_history(ts, rows)
 
     ok = sum(1 for r in rows if r["last_login_raw"])
-    print(f"[OK] Coleta feita {ok}/{len(rows)} com 'Last login' · {ts}")
+    print(f"[OK] Coleta (True Knife) feita {ok}/{len(rows)} com 'Last login' · {ts}")
+
 
 if __name__ == "__main__":
     main()
